@@ -292,7 +292,11 @@ static void ipipe_timer_release_sync(void)
 {
 	struct ipipe_timer *timer = __ipipe_this_cpu_read(percpu_timer);
 
-	timer->release(timer);
+        if (timer != NULL)  {
+            timer->release(timer);
+        } else {
+            printk("I-pipe: NULL timer in ipipe_timer_release_sync!\n");
+        }
 }
 
 void ipipe_timers_release(void)
