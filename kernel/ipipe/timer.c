@@ -230,14 +230,20 @@ int ipipe_select_timers(const struct cpumask *mask)
 
 	/* First, choose timers for the CPUs handled by ipipe */
 	for_each_cpu(cpu, mask) {
+                printk("ipipe_select_timers: doing cpu %u\n", cpu);
 		list_for_each_entry(t, &timers, link) {
-			if (!cpumask_test_cpu(cpu, t->cpumask))
+                        printk("    looking at timer %p\n", t);
+			if (!cpumask_test_cpu(cpu, t->cpumask)) {
+                                printk("    timer %p is invalid for cpu %u, skipping\n", t, cpu);
 				continue;
+                        }
 
 #ifdef CONFIG_GENERIC_CLOCKEVENTS
 			evtdev = t->host_timer;
-			if (evtdev && evtdev->mode == CLOCK_EVT_MODE_SHUTDOWN)
+			if (evtdev && evtdev->mode == CLOCK_EVT_MODE_SHUTDOWN) {
+                                printk("    timer %p mode is CLOCK_EVT_MODE_SHUTDOWN, skipping\n", t);
 				continue;
+                        }
 #endif /* CONFIG_GENERIC_CLOCKEVENTS */
 			goto found;
 		}
@@ -246,8 +252,11 @@ int ipipe_select_timers(const struct cpumask *mask)
 		       cpu);
 		goto err_remove_all;
 found:
+                printk("    ok!  installing timer %p (freq %u) on cpu %u\n", t, hrclock_freq, cpu);
 		install_pcpu_timer(cpu, hrclock_freq, t);
 	}
+
+        printk("    done with I-pipe timers!\n");
 
 	/*
 	 * Second, check if we need to fix up any CPUs not supported
@@ -275,6 +284,7 @@ found:
 	return 0;
 
 err_remove_all:
+        printk("    bailing out!\n");
 	spin_unlock_irqrestore(&lock, flags);
 
 	for_each_cpu(cpu, mask) {
