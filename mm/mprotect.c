@@ -218,6 +218,12 @@ success:
 		hugetlb_change_protection(vma, start, end, vma->vm_page_prot);
 	else
 		change_protection(vma, start, end, vma->vm_page_prot, dirty_accountable);
+#ifdef CONFIG_IPIPE
+	if (test_bit(MMF_VM_PINNED, &mm->flags) &&
+	    ((vma->vm_flags | mm->def_flags) & VM_LOCKED) &&
+	    (vma->vm_flags & (VM_READ | VM_WRITE | VM_EXEC)))
+		__ipipe_pin_vma(mm, vma);
+#endif
 	mmu_notifier_invalidate_range_end(mm, start, end);
 	vm_stat_account(mm, oldflags, vma->vm_file, -nrpages);
 	vm_stat_account(mm, newflags, vma->vm_file, nrpages);
