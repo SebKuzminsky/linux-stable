@@ -1501,7 +1501,9 @@ void scheduler_ipi(void)
 	 * however a fair share of IPIs are still resched only so this would
 	 * somewhat pessimize the simple resched case.
 	 */
+#ifndef IPIPE_ARCH_HAVE_VIRQ_IPI
 	irq_enter();
+#endif
 	sched_ttwu_pending();
 
 	/*
@@ -1511,7 +1513,9 @@ void scheduler_ipi(void)
 		this_rq()->idle_balance = 1;
 		raise_softirq_irqoff(SCHED_SOFTIRQ);
 	}
+#ifndef IPIPE_ARCH_HAVE_VIRQ_IPI
 	irq_exit();
+#endif
 }
 
 static void ttwu_queue_remote(struct task_struct *p, int cpu)
@@ -1585,7 +1589,8 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 
 	smp_wmb();
 	raw_spin_lock_irqsave(&p->pi_lock, flags);
-	if (!(p->state & state))
+	if (!(p->state & state) ||
+	    (p->state & (TASK_NOWAKEUP|TASK_HARDENING)))
 		goto out;
 
 	success = 1; /* we're going to change ->state */
@@ -2027,6 +2032,8 @@ asmlinkage void schedule_tail(struct task_struct *prev)
 {
 	struct rq *rq = this_rq();
 
+	__ipipe_complete_domain_migration();
+
 	finish_task_switch(rq, prev);
 
 	/*
@@ -2047,16 +2054,21 @@ asmlinkage void schedule_tail(struct task_struct *prev)
  * context_switch - switch to the new MM and the new
  * thread's register state.
  */
-static inline void
+int
 context_switch(struct rq *rq, struct task_struct *prev,
 	       struct task_struct *next)
 {
 	struct mm_struct *mm, *oldmm;
 
-	prepare_task_switch(rq, prev, next);
-
 	mm = next->mm;
 	oldmm = prev->active_mm;
+
+if (!rq) {
+	switch_mm(oldmm, next->active_mm, next);
+	if (!mm) enter_lazy_tlb(oldmm, next);
+} else {
+	prepare_task_switch(rq, prev, next);
+
 	/*
 	 * For paravirt, this is coupled with an exit in switch_to to
 	 * combine the page table reload and the switch backend into
@@ -2084,11 +2096,19 @@ context_switch(struct rq *rq, struct task_struct *prev,
 #ifndef __ARCH_WANT_UNLOCKED_CTXSW
 	spin_release(&rq->lock.dep_map, 1, _THIS_IP_);
 #endif
+}
+#ifdef CONFIG_IPIPE
+        next->ptd[IPIPE_ROOT_NPTDKEYS - 1] = prev;
+#endif /* CONFIG_IPIPE */
 
 	/* Here we just switch the register state and the stack. */
 	switch_to(prev, next, prev);
 
 	barrier();
+
+if (unlikely(rq)) {
+	if (unlikely(__ipipe_switch_tail()))
+		return 1; __ipipe_notify_kevent(-2, NULL);
 	/*
 	 * this_rq must be evaluated again because prev may have moved
 	 * CPUs since it called schedule(), thus the 'rq' on its stack
@@ -2096,6 +2116,10 @@ context_switch(struct rq *rq, struct task_struct *prev,
 	 */
 	finish_task_switch(this_rq(), prev);
 }
+	return 0;
+}
+
+EXPORT_SYMBOL(context_switch);
 
 /*
  * nr_running, nr_uninterruptible and nr_context_switches:
@@ -3193,6 +3217,7 @@ notrace unsigned long get_parent_ip(unsigned long addr)
 
 void __kprobes add_preempt_count(int val)
 {
+ 	ipipe_root_only();
 #ifdef CONFIG_DEBUG_PREEMPT
 	/*
 	 * Underflow?
@@ -3260,6 +3285,7 @@ static noinline void __schedule_bug(struct task_struct *prev)
  */
 static inline void schedule_debug(struct task_struct *prev)
 {
+	ipipe_root_only();
 	/*
 	 * Test if we are atomic. Since do_exit() needs to call into
 	 * schedule() atomically, we ignore that path for now.
@@ -3312,7 +3338,7 @@ pick_next_task(struct rq *rq)
 /*
  * __schedule() is the main scheduler function.
  */
-static void __sched __schedule(void)
+static int __sched __schedule(void)
 {
 	struct task_struct *prev, *next;
 	unsigned long *switch_count;
@@ -3325,6 +3351,10 @@ need_resched:
 	rq = cpu_rq(cpu);
 	rcu_note_context_switch(cpu);
 	prev = rq->curr;
+
+ 	if (unlikely(prev->state & TASK_HARDENING))
+		/* Pop one disable level -- one still remains. */
+		preempt_enable();
 
 	schedule_debug(prev);
 
@@ -3372,7 +3402,8 @@ need_resched:
 		rq->curr = next;
 		++*switch_count;
 
-		context_switch(rq, prev, next); /* unlocks the rq */
+ 		if (context_switch(rq, prev, next)) /* unlocks the rq */
+  			return 1; /* task hijacked by higher domain */
 		/*
 		 * The context switch have flipped the stack from under us
 		 * and restored the local variables which were saved when
@@ -3381,14 +3412,18 @@ need_resched:
 		 */
 		cpu = smp_processor_id();
 		rq = cpu_rq(cpu);
-	} else
+	} else {
+  		prev->state &= ~TASK_HARDENING;
 		raw_spin_unlock_irq(&rq->lock);
+	}
 
 	post_schedule(rq);
 
 	sched_preempt_enable_no_resched();
 	if (need_resched())
 		goto need_resched;
+
+	return 0;
 }
 
 static inline void sched_submit_work(struct task_struct *tsk)
@@ -3488,7 +3523,8 @@ asmlinkage void __sched notrace preempt_schedule(void)
 
 	do {
 		add_preempt_count_notrace(PREEMPT_ACTIVE);
-		__schedule();
+		if (__schedule())
+			return;
 		sub_preempt_count_notrace(PREEMPT_ACTIVE);
 
 		/*
@@ -3550,6 +3586,8 @@ static void __wake_up_common(wait_queue_head_t *q, unsigned int mode,
 			int nr_exclusive, int wake_flags, void *key)
 {
 	wait_queue_t *curr, *next;
+
+	ipipe_root_only();
 
 	list_for_each_entry_safe(curr, next, &q->task_list, task_list) {
 		unsigned flags = curr->flags;
@@ -4332,6 +4370,7 @@ recheck:
 	oldprio = p->prio;
 	prev_class = p->sched_class;
 	__setscheduler(rq, p, policy, param->sched_priority);
+  	__ipipe_report_setsched(p);
 
 	if (running)
 		p->sched_class->set_curr_task(rq);
@@ -5079,6 +5118,7 @@ void __cpuinit init_idle(struct task_struct *idle, int cpu)
 
 	/* Set the preempt count _outside_ the spinlocks! */
 	task_thread_info(idle)->preempt_count = 0;
+	ipipe_root_only();
 
 	/*
 	 * The idle tasks have their own, simple scheduling class:
@@ -8401,3 +8441,40 @@ struct cgroup_subsys cpuacct_subsys = {
 	.subsys_id = cpuacct_subsys_id,
 };
 #endif	/* CONFIG_CGROUP_CPUACCT */
+
+#ifdef CONFIG_IPIPE
+
+int __ipipe_migrate_head(void)
+{
+	struct task_struct *p = current;
+
+	preempt_disable();
+
+	IPIPE_WARN_ONCE(__this_cpu_read(ipipe_percpu.task_hijacked) != NULL);
+
+	__this_cpu_write(ipipe_percpu.task_hijacked, p);
+	set_current_state(TASK_INTERRUPTIBLE | TASK_HARDENING);
+	sched_submit_work(p);
+	if (likely(__schedule()))
+		return 0;
+
+	if (signal_pending(p))
+		return -ERESTARTSYS;
+
+	BUG();
+}
+EXPORT_SYMBOL_GPL(__ipipe_migrate_head);
+
+void __ipipe_reenter_root(void)
+{
+	struct rq *rq = this_rq();
+	struct task_struct *p;
+
+	p = __this_cpu_read(ipipe_percpu.rqlock_owner);
+	finish_task_switch(rq, p);
+	post_schedule(rq);
+	preempt_enable_no_resched();
+}
+EXPORT_SYMBOL_GPL(__ipipe_reenter_root);
+
+#endif /* CONFIG_IPIPE */
